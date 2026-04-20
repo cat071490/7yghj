@@ -309,6 +309,95 @@ function Admin._registerCommands()
         end
     }
 
+    -- Helper: find a player's character by name. Accepts either the account
+    -- name shown in the dashboard header (resolved via PlayerController ->
+    -- PlayerState.PlayerNamePrivate) OR the UE actor name shown by wp.players
+    -- (e.g. "BP_R5Character_C_2147419160"). Tries account name first, then
+    -- falls back to actor name.
+    local function findCharByName(targetName)
+        local target = targetName:lower()
+        local pcs = FindAllOf("PlayerController")
+        if pcs then
+            for _, pc in ipairs(pcs) do
+                if pc:IsValid() then
+                    local pName = nil
+                    pcall(function()
+                        local ps = pc.PlayerState
+                        if ps and ps:IsValid() then
+                            local val = ps.PlayerNamePrivate
+                            if val then
+                                local ok, s = pcall(function() return val:ToString() end)
+                                if ok and s then pName = s end
+                            end
+                        end
+                    end)
+                    if pName and pName:lower() == target then
+                        local pawn = nil
+                        pcall(function()
+                            if pc.Pawn and pc.Pawn:IsValid() then pawn = pc.Pawn end
+                        end)
+                        if pawn then return pawn end
+                    end
+                end
+            end
+        end
+        local chars = FindAllOf("R5Character")
+        if chars then
+            for _, char in ipairs(chars) do
+                if char:IsValid() then
+                    local charName = nil
+                    pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
+                    if charName and charName:lower() == target then
+                        return char
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Candidate component names and direct properties that might expose health.
+    -- Windrose/R5 uses UE5; "HealthComponent" isn't necessarily what they call
+    -- it. Each entry is a { container, propCurrent, propMax } tuple where
+    -- container = nil means read directly on the character.
+    local HEALTH_PATHS = {
+        { "HealthComponent",    "CurrentHealth", "MaxHealth" },
+        { "Health",             "CurrentHealth", "MaxHealth" },
+        { "HealthSystem",       "CurrentHealth", "MaxHealth" },
+        { "R5HealthComponent",  "CurrentHealth", "MaxHealth" },
+        { "BLHealthComponent",  "CurrentHealth", "MaxHealth" },
+        { "VitalsComponent",    "Health",        "MaxHealth" },
+        { "DamageComponent",    "Health",        "MaxHealth" },
+        { "StatsComponent",     "Health",        "MaxHealth" },
+        { nil,                  "CurrentHealth", "MaxHealth" },
+        { nil,                  "Health",        "MaxHealth" },
+    }
+
+    -- Resolve the first health path that exists on the given character.
+    -- Returns (container, curProp, maxProp, curValue, maxValue) or nil.
+    local function resolveHealthPath(char)
+        for _, p in ipairs(HEALTH_PATHS) do
+            local compName, curProp, maxProp = p[1], p[2], p[3]
+            local container = char
+            if compName then
+                local c = nil
+                pcall(function() if char[compName] and char[compName]:IsValid() then c = char[compName] end end)
+                container = c
+            end
+            if container then
+                local cur, mx
+                pcall(function() cur = container[curProp] end)
+                pcall(function() mx = container[maxProp] end)
+                -- Require actual numbers, not UObject wrappers (UE5 GAS wraps
+                -- attributes in objects — those need a different write path).
+                if type(cur) == "number" and type(mx) == "number" and mx > 0 then
+                    return container, curProp, maxProp, cur, mx
+                end
+            end
+        end
+        return nil
+    end
+
     Admin._commands["wp.godmode"] = {
         description = "Enable/disable invulnerability for a target player",
         usage = "wp.godmode <player> [on|off]",
@@ -342,83 +431,62 @@ function Admin._registerCommands()
                 return "Player name required (god mode must target a specific player)"
             end
 
-            local chars = FindAllOf("R5Character")
-            if not chars then return "No character data" end
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
 
             -- Cache original health per-player so disabling cleanly restores them.
-            -- Same pattern as Admin._origMaxWalkSpeed used by wp.speed.
             Admin._origHealth = Admin._origHealth or {}
 
             local GOD_HP = 9999999
 
-            local count = 0
-            local healthApplied = 0
+            -- Belt: flip any invuln flags the engine actually exposes.
+            pcall(function() char.bCanBeDamaged = not enable end)
+            pcall(function() char.bIsInvulnerable = enable end)
+            pcall(function() char.bInvincible = enable end)
+
+            -- Suspenders: clamp health via whichever path actually exists on
+            -- this build. If none of the candidate paths has both current+max
+            -- props, we can only rely on the flags.
+            local healthApplied = false
             local noSnapshot = false
             local cacheDirty = false
-            for _, char in ipairs(chars) do
-                if char:IsValid() then
-                    local charName = nil
-                    pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
-                    if charName and charName:lower() == targetName then
-                        count = count + 1
+            local usedPath = nil
 
-                        -- Belt: flip any invuln flags the engine actually exposes.
-                        pcall(function() char.bCanBeDamaged = not enable end)
-                        pcall(function() char.bIsInvulnerable = enable end)
-                        pcall(function() char.bInvincible = enable end)
-
-                        -- Suspenders: clamp health. CurrentHealth/MaxHealth are known-good
-                        -- (wp.health reads them). Set Max before Current so Current isn't
-                        -- clamped back down by a stale max.
-                        pcall(function()
-                            local hc = char.HealthComponent
-                            if not (hc and hc:IsValid()) then return end
-                            if enable then
-                                -- Snapshot only on first enable so a repeat `on` doesn't
-                                -- overwrite the real baseline with 9999999.
-                                if not Admin._origHealth[targetName] then
-                                    local cur = hc.CurrentHealth
-                                    local mx = hc.MaxHealth
-                                    if cur and mx and mx > 0 then
-                                        Admin._origHealth[targetName] = { current = cur, max = mx }
-                                        cacheDirty = true
-                                    end
-                                end
-                                hc.MaxHealth = GOD_HP
-                                hc.CurrentHealth = GOD_HP
-                                healthApplied = healthApplied + 1
-                            else
-                                local snap = Admin._origHealth[targetName]
-                                if snap then
-                                    hc.MaxHealth = snap.max
-                                    hc.CurrentHealth = math.min(snap.current, snap.max)
-                                    Admin._origHealth[targetName] = nil
-                                    cacheDirty = true
-                                    healthApplied = healthApplied + 1
-                                else
-                                    -- No cached baseline (wasn't enabled, or baseline already
-                                    -- consumed). Leave health alone rather than guessing.
-                                    noSnapshot = true
-                                end
-                            end
-                        end)
+            local container, curProp, maxProp, curVal, maxVal = resolveHealthPath(char)
+            if container then
+                usedPath = (container == char) and ("char." .. curProp) or ("<component>." .. curProp)
+                if enable then
+                    if not Admin._origHealth[targetName] then
+                        if curVal and maxVal and maxVal > 0 then
+                            Admin._origHealth[targetName] = { current = curVal, max = maxVal }
+                            cacheDirty = true
+                        end
+                    end
+                    pcall(function() container[maxProp] = GOD_HP end)
+                    pcall(function() container[curProp] = GOD_HP end)
+                    healthApplied = true
+                else
+                    local snap = Admin._origHealth[targetName]
+                    if snap then
+                        pcall(function() container[maxProp] = snap.max end)
+                        pcall(function() container[curProp] = math.min(snap.current, snap.max) end)
+                        Admin._origHealth[targetName] = nil
+                        cacheDirty = true
+                        healthApplied = true
+                    else
+                        noSnapshot = true
                     end
                 end
             end
 
-            -- Persist baselines to disk so a server crash mid-godmode doesn't
-            -- strand the player at 9999999 HP on next boot.
             if cacheDirty then Admin._saveGodmodeCache() end
 
-            if count == 0 then
-                return "Player '" .. targetName .. "' not found"
-            end
             local status = enable and "enabled" or "disabled"
             local detail
-            if healthApplied > 0 then
-                detail = enable and (" (HP " .. GOD_HP .. ", original cached)") or " (HP restored)"
+            if healthApplied then
+                detail = enable and (" (HP " .. GOD_HP .. " via " .. usedPath .. ", original cached)") or " (HP restored)"
             elseif enable then
-                detail = " (warning: HealthComponent not found, only flags attempted)"
+                detail = " (warning: no health path matched; flags set but server-side damage may still kill — run wp.probe_char " .. targetName .. ")"
             elseif noSnapshot then
                 detail = " (no cached baseline, health left as-is)"
             else
@@ -428,26 +496,112 @@ function Admin._registerCommands()
         end
     }
 
+    Admin._commands["wp.probe_char"] = {
+        hidden = true, category = "debug",
+        description = "Dump components and health-ish properties on a player's character",
+        usage = "wp.probe_char <player>",
+        playerArg = true,
+        handler = function(args)
+            if #args < 1 then return "Usage: wp.probe_char <player>" end
+            local targetName = table.concat(args, " "):lower()
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+
+            local lines = {}
+            pcall(function() table.insert(lines, "FullName: " .. char:GetFullName()) end)
+
+            -- Probe likely component names.
+            local compCandidates = {
+                "HealthComponent", "Health", "HealthSystem", "R5HealthComponent",
+                "BLHealthComponent", "VitalsComponent", "DamageComponent",
+                "StatsComponent", "AttributeComponent", "AttributeSet",
+                "AbilitySystemComponent", "ASC", "StaminaComponent", "HungerComponent",
+                "ThirstComponent", "DamageSystem", "CombatComponent",
+            }
+            table.insert(lines, "--- Components on character ---")
+            for _, name in ipairs(compCandidates) do
+                pcall(function()
+                    local c = char[name]
+                    if c and c:IsValid() then
+                        local fn = "?"
+                        pcall(function() fn = c:GetFullName() end)
+                        table.insert(lines, "  " .. name .. " = " .. fn)
+                    end
+                end)
+            end
+
+            -- Probe scalar health-ish properties directly on the character.
+            local propCandidates = {
+                "Health", "CurrentHealth", "MaxHealth", "BaseHealth",
+                "HP", "CurrentHP", "MaxHP",
+                "Stamina", "CurrentStamina", "MaxStamina",
+                "Armor", "CurrentArmor", "MaxArmor",
+                "bCanBeDamaged", "bIsInvulnerable", "bInvincible",
+                "bGodMode", "bImmortal",
+            }
+            table.insert(lines, "--- Scalar properties on character ---")
+            for _, name in ipairs(propCandidates) do
+                pcall(function()
+                    local v = char[name]
+                    if v ~= nil then
+                        table.insert(lines, "  " .. name .. " = " .. tostring(v))
+                    end
+                end)
+            end
+
+            -- Dig into each component for its scalar props AND any UObject
+            -- props (UE5 gameplay attributes often wrap the float in a sub-obj,
+            -- so we need to peek one level deeper).
+            table.insert(lines, "--- Properties on found components ---")
+            local compPropCandidates = {
+                "CurrentHealth", "MaxHealth", "Health", "BaseHealth",
+                "CurrentHP", "MaxHP", "HP",
+                "bInvulnerable", "bIsInvulnerable", "bInvincible", "bGodMode",
+                "HealthAttributeSet", "AttributeSet", "Attributes",
+            }
+            local innerPropCandidates = {
+                "BaseValue", "CurrentValue", "Value", "DefaultValue",
+                "Minimum", "Maximum", "BaseHealth", "HealthRegenRate",
+            }
+            for _, cname in ipairs(compCandidates) do
+                pcall(function()
+                    local c = char[cname]
+                    if c and c:IsValid() then
+                        for _, pname in ipairs(compPropCandidates) do
+                            pcall(function()
+                                local v = c[pname]
+                                if v ~= nil then
+                                    local disp = tostring(v)
+                                    -- If it's a UObject, dump its class + inner props.
+                                    local cls = nil
+                                    pcall(function() cls = v:GetClass():GetFullName() end)
+                                    if cls then
+                                        table.insert(lines, "  " .. cname .. "." .. pname .. " = <" .. cls .. ">")
+                                        for _, ip in ipairs(innerPropCandidates) do
+                                            pcall(function()
+                                                local iv = v[ip]
+                                                if iv ~= nil then
+                                                    table.insert(lines, "    ." .. ip .. " = " .. tostring(iv))
+                                                end
+                                            end)
+                                        end
+                                    else
+                                        table.insert(lines, "  " .. cname .. "." .. pname .. " = " .. disp)
+                                    end
+                                end
+                            end)
+                        end
+                    end
+                end)
+            end
+
+            return table.concat(lines, "\n")
+        end
+    }
+
     -- =========================================
     -- Player state: heal / kill / freeze
     -- =========================================
-
-    -- Helper: find an R5Character whose trailing FullName matches targetName (lowercased).
-    -- Returns the char object or nil.
-    local function findCharByName(targetName)
-        local chars = FindAllOf("R5Character")
-        if not chars then return nil end
-        for _, char in ipairs(chars) do
-            if char:IsValid() then
-                local charName = nil
-                pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
-                if charName and charName:lower() == targetName then
-                    return char
-                end
-            end
-        end
-        return nil
-    end
 
     Admin._commands["wp.heal"] = {
         description = "Restore a player's HP to full",
