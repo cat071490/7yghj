@@ -344,16 +344,60 @@ function Admin._registerCommands()
             local chars = FindAllOf("R5Character")
             if not chars then return "No character data" end
 
+            -- Cache original health per-player so disabling cleanly restores them.
+            -- Same pattern as Admin._origMaxWalkSpeed used by wp.speed.
+            Admin._origHealth = Admin._origHealth or {}
+
+            local GOD_HP = 9999999
+
             local count = 0
+            local healthApplied = 0
+            local noSnapshot = false
             for _, char in ipairs(chars) do
                 if char:IsValid() then
                     local charName = nil
                     pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
                     if charName and charName:lower() == targetName then
+                        count = count + 1
+
+                        -- Belt: flip any invuln flags the engine actually exposes.
                         pcall(function() char.bCanBeDamaged = not enable end)
                         pcall(function() char.bIsInvulnerable = enable end)
                         pcall(function() char.bInvincible = enable end)
-                        count = count + 1
+
+                        -- Suspenders: clamp health. CurrentHealth/MaxHealth are known-good
+                        -- (wp.health reads them). Set Max before Current so Current isn't
+                        -- clamped back down by a stale max.
+                        pcall(function()
+                            local hc = char.HealthComponent
+                            if not (hc and hc:IsValid()) then return end
+                            if enable then
+                                -- Snapshot only on first enable so a repeat `on` doesn't
+                                -- overwrite the real baseline with 9999999.
+                                if not Admin._origHealth[targetName] then
+                                    local cur = hc.CurrentHealth
+                                    local mx = hc.MaxHealth
+                                    if cur and mx and mx > 0 then
+                                        Admin._origHealth[targetName] = { current = cur, max = mx }
+                                    end
+                                end
+                                hc.MaxHealth = GOD_HP
+                                hc.CurrentHealth = GOD_HP
+                                healthApplied = healthApplied + 1
+                            else
+                                local snap = Admin._origHealth[targetName]
+                                if snap then
+                                    hc.MaxHealth = snap.max
+                                    hc.CurrentHealth = math.min(snap.current, snap.max)
+                                    Admin._origHealth[targetName] = nil
+                                    healthApplied = healthApplied + 1
+                                else
+                                    -- No cached baseline (wasn't enabled, or server restarted).
+                                    -- Leave health alone rather than guessing a safe value.
+                                    noSnapshot = true
+                                end
+                            end
+                        end)
                     end
                 end
             end
@@ -361,7 +405,18 @@ function Admin._registerCommands()
             if count == 0 then
                 return "Player '" .. targetName .. "' not found"
             end
-            return "God mode " .. (enable and "enabled" or "disabled") .. " for " .. targetName
+            local status = enable and "enabled" or "disabled"
+            local detail
+            if healthApplied > 0 then
+                detail = enable and (" (HP " .. GOD_HP .. ", original cached)") or " (HP restored)"
+            elseif enable then
+                detail = " (warning: HealthComponent not found, only flags attempted)"
+            elseif noSnapshot then
+                detail = " (no cached baseline, health left as-is)"
+            else
+                detail = ""
+            end
+            return "God mode " .. status .. " for " .. targetName .. detail
         end
     }
 
