@@ -18,6 +18,7 @@ function Admin.init(config, gameDir)
     Admin._config = config
     Admin._gameDir = gameDir
     Admin._loadGodmodeCache()
+    Admin._registerDamageHooks()
     Admin._registerCommands()
     -- NOTE: RegisterConsoleCommandHandler requires HookProcessConsoleExec=1
     -- which crashes Windrose dedicated servers. Commands are RCON-only.
@@ -630,6 +631,51 @@ function Admin._registerCommands()
                 table.insert(lines, "  (none of the standard candidates matched — try wp.probe_prop with specific guesses)")
             end
             return table.concat(lines, "\n")
+        end
+    }
+
+    Admin._commands["wp.damage_probe"] = {
+        hidden = true, category = "debug",
+        description = "Diagnostic: count which damage UFunctions fire during play. Precursor to hook-based per-player godmode.",
+        usage = "wp.damage_probe <on|off|reset|stats>",
+        examples = {
+            "wp.damage_probe on",
+            "wp.damage_probe stats",
+            "wp.damage_probe off",
+        },
+        handler = function(args)
+            local action = (args[1] or "stats"):lower()
+            if action == "on" then
+                Admin._damageHookEnabled = true
+                return "Damage probe ENABLED. Take damage in-game, then run 'wp.damage_probe stats'. Remember to 'wp.damage_probe off' afterwards — these hooks fire on every damage event for every actor on the server."
+            elseif action == "off" then
+                Admin._damageHookEnabled = false
+                return "Damage probe disabled."
+            elseif action == "reset" then
+                Admin._damageHookCounters = {}
+                Admin._damageHookLastFire = {}
+                return "Counters cleared."
+            elseif action == "stats" then
+                local keys = {}
+                for k in pairs(Admin._damageHookCounters) do table.insert(keys, k) end
+                table.sort(keys, function(a, b)
+                    return (Admin._damageHookCounters[a] or 0) > (Admin._damageHookCounters[b] or 0)
+                end)
+                if #keys == 0 then
+                    return "No damage hooks have fired. State: " .. (Admin._damageHookEnabled and "ENABLED" or "disabled") .. ". Turn it on with 'wp.damage_probe on' and take damage."
+                end
+                local now = os.time()
+                local lines = { "Damage hook fires (state: " .. (Admin._damageHookEnabled and "ENABLED" or "disabled") .. "):" }
+                for _, k in ipairs(keys) do
+                    local count = Admin._damageHookCounters[k]
+                    local last = Admin._damageHookLastFire[k]
+                    local ago = last and (now - last) or 0
+                    table.insert(lines, string.format("  %d fires, %ds ago | %s", count, ago, k))
+                end
+                return table.concat(lines, "\n")
+            else
+                return "Usage: wp.damage_probe <on|off|reset|stats>"
+            end
         end
     }
 
@@ -1808,6 +1854,69 @@ function Admin._loadGodmodeCache()
     if #names > 0 then
         Log.warn("Admin", "Stale godmode baselines loaded for: " .. table.concat(names, ", ")
             .. ". Run 'wp.godmode <player> off' when each is online to restore real HP.")
+    end
+end
+
+-- ============================================================
+-- Damage hook probe (Phase 1: discovery only, does NOT block damage)
+-- ============================================================
+-- Windrose uses GAS-style wrapped health attributes, so direct property
+-- writes can't reliably modify HP. To build per-player godmode we need
+-- to hook whichever UFunction carries the damage application, then in
+-- a later phase short-circuit it when the victim is whitelisted.
+--
+-- Step 1 is figuring out WHICH function carries damage on this build.
+-- We register candidate hooks at startup; each just increments a counter
+-- and records a timestamp. The hook body is almost free when the probe
+-- is disabled (just an early-return on the flag).
+--
+-- Operator flow:
+--   wp.damage_probe on      -- start counting
+--   <take damage in-game>
+--   wp.damage_probe stats   -- see which hooks fired
+--   wp.damage_probe off     -- stop counting
+Admin._damageHookCounters = {}
+Admin._damageHookLastFire = {}
+Admin._damageHookEnabled = false
+Admin._damageHooksRegistered = false
+
+-- Candidate UFunction names. UE4SS logs a warning for any that don't
+-- resolve but does not crash, so over-registering is fine.
+Admin._DAMAGE_HOOK_CANDIDATES = {
+    -- Stock UE Actor/Pawn/Character damage entry points
+    "/Script/Engine.Actor:ReceiveAnyDamage",
+    "/Script/Engine.Actor:ReceivePointDamage",
+    "/Script/Engine.Actor:ReceiveRadialDamage",
+    "/Script/Engine.Actor:TakeDamage",
+    "/Script/Engine.Pawn:TakeDamage",
+    "/Script/Engine.Character:TakeDamage",
+    -- R5 character-level (confirmed package prefix: /Script/R5.)
+    "/Script/R5.R5Character:TakeDamage",
+    "/Script/R5.R5Character:ReceiveAnyDamage",
+    "/Script/R5.R5Character:ReceivePointDamage",
+    -- HealthComponent-level (we know char.HealthComponent exists)
+    "/Script/R5.HealthComponent:TakeDamage",
+    "/Script/R5.HealthComponent:ApplyDamage",
+    "/Script/R5.HealthComponent:OnDamaged",
+    "/Script/R5.R5HealthComponent:TakeDamage",
+    "/Script/R5.R5HealthComponent:ApplyDamage",
+    -- GAS layer (UE5 Gameplay Ability System)
+    "/Script/GameplayAbilities.AbilitySystemComponent:ApplyGameplayEffectSpecToSelf",
+    "/Script/GameplayAbilities.AbilitySystemComponent:ApplyGameplayEffectSpecToTarget",
+}
+
+function Admin._registerDamageHooks()
+    if Admin._damageHooksRegistered then return end
+    Admin._damageHooksRegistered = true
+    for _, fname in ipairs(Admin._DAMAGE_HOOK_CANDIDATES) do
+        -- pcall in case UE4SS raises on an unknown symbol format on this build
+        pcall(function()
+            RegisterHook(fname, function()
+                if not Admin._damageHookEnabled then return end
+                Admin._damageHookCounters[fname] = (Admin._damageHookCounters[fname] or 0) + 1
+                Admin._damageHookLastFire[fname] = os.time()
+            end)
+        end)
     end
 end
 
