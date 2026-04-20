@@ -17,6 +17,7 @@ Admin._bootTime = os.time()  -- track server start for uptime (no wmic needed)
 function Admin.init(config, gameDir)
     Admin._config = config
     Admin._gameDir = gameDir
+    Admin._loadGodmodeCache()
     Admin._registerCommands()
     -- NOTE: RegisterConsoleCommandHandler requires HookProcessConsoleExec=1
     -- which crashes Windrose dedicated servers. Commands are RCON-only.
@@ -353,6 +354,7 @@ function Admin._registerCommands()
             local count = 0
             local healthApplied = 0
             local noSnapshot = false
+            local cacheDirty = false
             for _, char in ipairs(chars) do
                 if char:IsValid() then
                     local charName = nil
@@ -379,6 +381,7 @@ function Admin._registerCommands()
                                     local mx = hc.MaxHealth
                                     if cur and mx and mx > 0 then
                                         Admin._origHealth[targetName] = { current = cur, max = mx }
+                                        cacheDirty = true
                                     end
                                 end
                                 hc.MaxHealth = GOD_HP
@@ -390,10 +393,11 @@ function Admin._registerCommands()
                                     hc.MaxHealth = snap.max
                                     hc.CurrentHealth = math.min(snap.current, snap.max)
                                     Admin._origHealth[targetName] = nil
+                                    cacheDirty = true
                                     healthApplied = healthApplied + 1
                                 else
-                                    -- No cached baseline (wasn't enabled, or server restarted).
-                                    -- Leave health alone rather than guessing a safe value.
+                                    -- No cached baseline (wasn't enabled, or baseline already
+                                    -- consumed). Leave health alone rather than guessing.
                                     noSnapshot = true
                                 end
                             end
@@ -401,6 +405,10 @@ function Admin._registerCommands()
                     end
                 end
             end
+
+            -- Persist baselines to disk so a server crash mid-godmode doesn't
+            -- strand the player at 9999999 HP on next boot.
+            if cacheDirty then Admin._saveGodmodeCache() end
 
             if count == 0 then
                 return "Player '" .. targetName .. "' not found"
@@ -1118,6 +1126,56 @@ end
 -- Delegate to shared helper in WindrosePlus global
 function Admin._isConnected(pc)
     return WindrosePlus._isConnected(pc)
+end
+
+-- Disk persistence for wp.godmode baselines. If the server crashes while a
+-- player is in god mode, their saved HP may be 9999999; without the baseline
+-- on disk we have no way to restore the real value. Cache is per-player name.
+Admin._GODMODE_CACHE_FILE = "windrose_plus_data\\godmode_baselines.json"
+
+function Admin._godmodeCachePath()
+    if not Admin._gameDir then return nil end
+    return Admin._gameDir .. Admin._GODMODE_CACHE_FILE
+end
+
+function Admin._saveGodmodeCache()
+    local path = Admin._godmodeCachePath()
+    if not path then return end
+    local ok, encoded = pcall(json.encode, Admin._origHealth or {})
+    if not ok then
+        Log.warn("Admin", "Failed to encode godmode baselines: " .. tostring(encoded))
+        return
+    end
+    local f = io.open(path, "w")
+    if not f then
+        Log.warn("Admin", "Failed to write godmode baseline cache: " .. path)
+        return
+    end
+    f:write(encoded)
+    f:close()
+end
+
+function Admin._loadGodmodeCache()
+    Admin._origHealth = Admin._origHealth or {}
+    local path = Admin._godmodeCachePath()
+    if not path then return end
+    local f = io.open(path, "r")
+    if not f then return end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return end
+    local ok, decoded = pcall(json.decode, content)
+    if not ok or type(decoded) ~= "table" then
+        Log.warn("Admin", "Godmode baseline cache is corrupt, ignoring: " .. path)
+        return
+    end
+    Admin._origHealth = decoded
+    local names = {}
+    for k in pairs(decoded) do table.insert(names, k) end
+    if #names > 0 then
+        Log.warn("Admin", "Stale godmode baselines loaded for: " .. table.concat(names, ", ")
+            .. ". Run 'wp.godmode <player> off' when each is online to restore real HP.")
+    end
 end
 
 -- Helper: find players by name (case-insensitive exact match, or return all if no filter)
