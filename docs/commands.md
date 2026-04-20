@@ -423,9 +423,9 @@ Set world time of day in hours (0–24). Writes to `TimeOfDay`/`CurrentTimeOfDay
 Usage: wp.settime <hour>
 ```
 
-### wp.give (experimental)
+### wp.give
 
-Give a player an item by full Unreal blueprint path. See [docs/items.md](items.md) for the known path list and the experimental-status notes.
+Spawn an item at a player's feet by full Unreal blueprint path. For stackable items, sets a stack-count property on a single spawned actor; otherwise spawns `qty` separate actors with small positional jitter. See [docs/items.md](items.md) for the known path list and how this works internally.
 
 ```
 Usage: wp.give <player> <blueprint_path> [qty]
