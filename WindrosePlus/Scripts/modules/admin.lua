@@ -1882,7 +1882,13 @@ Admin._damageHooksRegistered = false
 
 -- Candidate UFunction names. UE4SS logs a warning for any that don't
 -- resolve but does not crash, so over-registering is fine.
+-- First entry is a canary (movement hook known to work from main.lua:534) —
+-- if even this one reports 0 fires after movement, the hook pipeline itself
+-- is broken, not just our damage guesses.
 Admin._DAMAGE_HOOK_CANDIDATES = {
+    -- Canary: known-good hook from main.lua, fires when the player moves.
+    "/Script/R5.R5MovementComponent:ServerSaveMoveInput",
+
     -- Stock UE Actor/Pawn/Character damage entry points
     "/Script/Engine.Actor:ReceiveAnyDamage",
     "/Script/Engine.Actor:ReceivePointDamage",
@@ -1890,16 +1896,45 @@ Admin._DAMAGE_HOOK_CANDIDATES = {
     "/Script/Engine.Actor:TakeDamage",
     "/Script/Engine.Pawn:TakeDamage",
     "/Script/Engine.Character:TakeDamage",
-    -- R5 character-level (confirmed package prefix: /Script/R5.)
+
+    -- R5 package variants (we've confirmed /Script/R5. is a valid namespace)
     "/Script/R5.R5Character:TakeDamage",
     "/Script/R5.R5Character:ReceiveAnyDamage",
     "/Script/R5.R5Character:ReceivePointDamage",
-    -- HealthComponent-level (we know char.HealthComponent exists)
+    "/Script/R5.R5Character:OnTakeDamage",
+    "/Script/R5.R5Character:OnDamaged",
+    "/Script/R5.R5Character:HandleDamage",
+    "/Script/R5.R5Character:DealDamage",
+    "/Script/R5.R5Character:ApplyDamage",
+
+    -- HealthComponent-level on multiple possible packages
     "/Script/R5.HealthComponent:TakeDamage",
     "/Script/R5.HealthComponent:ApplyDamage",
     "/Script/R5.HealthComponent:OnDamaged",
+    "/Script/R5.HealthComponent:HandleDamage",
+    "/Script/R5.HealthComponent:ModifyHealth",
     "/Script/R5.R5HealthComponent:TakeDamage",
     "/Script/R5.R5HealthComponent:ApplyDamage",
+    "/Script/R5.R5HealthComponent:OnDamaged",
+    "/Script/R5.R5HealthComponent:ModifyHealth",
+
+    -- R5BL (business logic) package — heavily used by Windrose per boot logs
+    "/Script/R5BusinessLogic.HealthComponent:TakeDamage",
+    "/Script/R5BusinessLogic.HealthComponent:ApplyDamage",
+    "/Script/R5BusinessLogic.R5HealthComponent:TakeDamage",
+    "/Script/R5BusinessLogic.R5HealthComponent:ApplyDamage",
+    "/Script/R5BusinessLogicCore.HealthComponent:TakeDamage",
+    "/Script/R5BusinessLogicCore.HealthComponent:ApplyDamage",
+    "/Script/R5BusinessLogicCore.R5HealthComponent:TakeDamage",
+    "/Script/R5BusinessLogicCore.R5HealthComponent:ApplyDamage",
+    "/Script/R5BusinessLogic.R5BLPlayer:TakeDamage",
+    "/Script/R5BusinessLogic.R5BLPlayer:ApplyDamage",
+
+    -- Combat / damage system candidates
+    "/Script/R5.CombatComponent:TakeDamage",
+    "/Script/R5.DamageSystem:ApplyDamage",
+    "/Script/R5.DamageManager:ApplyDamage",
+
     -- GAS layer (UE5 Gameplay Ability System)
     "/Script/GameplayAbilities.AbilitySystemComponent:ApplyGameplayEffectSpecToSelf",
     "/Script/GameplayAbilities.AbilitySystemComponent:ApplyGameplayEffectSpecToTarget",
