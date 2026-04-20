@@ -365,6 +365,73 @@ Speed set to 2.0x for 3 player(s)
 Speed set to 1.5x for humangenome
 ```
 
+### wp.godmode
+
+Toggle invulnerability for a specific player. Clamps `MaxHealth`/`CurrentHealth` to a very large value and attempts to set engine invuln flags. The original health values are cached to `windrose_plus_data\godmode_baselines.json` so a server crash doesn't strand the player at 9,999,999 HP — run `wp.godmode <player> off` to restore from the cached baseline.
+
+```
+Usage: wp.godmode <player> [on|off]
+```
+
+### wp.heal
+
+Restore a player's current HP to their max HP.
+
+```
+Usage: wp.heal <player>
+```
+
+### wp.kill
+
+Kill a player by setting HP to 0. Refuses if the target has god mode active.
+
+```
+Usage: wp.kill <player>
+```
+
+### wp.freeze
+
+Stop or resume a player's movement. Caches their pre-freeze speed state so unfreezing restores whatever `wp.speed` had set prior.
+
+```
+Usage: wp.freeze <player> [on|off]
+```
+
+### wp.teleport
+
+Move a player to world coordinates.
+
+```
+Usage: wp.teleport <player> <x> <y> <z>
+```
+
+### wp.tp
+
+Move one player to another. Uses the literal token `to` as a separator so both names may contain spaces.
+
+```
+Usage: wp.tp <source> to <destination>
+Example: wp.tp Alice to Bob
+Example: wp.tp John Smith to Jane Doe
+```
+
+### wp.settime
+
+Set world time of day in hours (0–24). Writes to `TimeOfDay`/`CurrentTimeOfDay` on any R5GameMode/GameState/WorldSettings object that exposes them.
+
+```
+Usage: wp.settime <hour>
+```
+
+### wp.give (experimental)
+
+Give a player an item by full Unreal blueprint path. See [docs/items.md](items.md) for the known path list and the experimental-status notes.
+
+```
+Usage: wp.give <player> <blueprint_path> [qty]
+Example: wp.give HumanGenome /Game/Core/Items/Currency/BP_GoldCoin.BP_GoldCoin_C 100
+```
+
 ---
 
 ## Debug
