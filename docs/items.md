@@ -16,9 +16,13 @@ wp.give Alice /Game/Core/Items/Weapons/Ranged/BP_Flintlock.BP_Flintlock_C
 
 Quantity is optional (defaults to `1`) and only meaningful for stackable items. For non-stackable items (most weapons, armor), the server will either give one copy or fail depending on inventory capacity; requesting `qty > 1` will attempt repeated adds.
 
-## Status: experimental
+## How it works
 
-The inventory API used by `wp.give` has not been confirmed against a running Windrose server. The command probes several common UE inventory component names (`InventoryComponent`, `Inventory`, `PlayerInventory`, `BackpackComponent`, `ItemContainer`, `R5InventoryComponent`) and method names (`AddItem`, `GiveItem`, `AddItemByClass`, `AddItemToInventory`, `SpawnItem`, `CreateItem`, `AddItemByPath`). If none match, the response will tell you to run `wp.inspect <player>` to discover the real API. Extend `INV_COMPONENTS` / `INV_METHODS` in `WindrosePlus/Scripts/modules/admin.lua` once the right names are known.
+`wp.give` calls `UWorld:SpawnActor` on the target player's world, placing the item actor at the player's feet. The game's own pickup logic then handles the rest. This sidesteps the inventory API entirely (the Windrose devs haven't exposed a server-side give method yet) and avoids the console-exec path that crashes Windrose dedicated servers.
+
+For stackable items, the command spawns a single actor and sets a stack property (`StackCount`, `Count`, `Amount`, `Quantity`, `ItemCount`, or `StackSize` — whichever exists on the class) to the requested quantity. If no stack property exists, it falls back to spawning `qty` separate actors with small positional jitter so they don't clip into one point.
+
+Max `qty` is 1000. The class path is resolved via `StaticFindObject`, so the blueprint must already be loaded — if you see "Blueprint class not found," the asset needs to be referenced somewhere in the game's loaded assets, or the path is wrong.
 
 ## Known blueprint paths
 

@@ -752,22 +752,27 @@ function Admin._registerCommands()
     -- Inventory: give (experimental)
     -- =========================================
 
-    -- EXPERIMENTAL: no confirmed inventory API on this server build. The command
-    -- probes a set of common UE inventory component + method names and calls the
-    -- first one that succeeds. If the report says "no inventory method found",
-    -- use wp.inspect on the target's R5Character to discover the real API and
-    -- extend INV_COMPONENTS / INV_METHODS below.
-    local INV_COMPONENTS = {
-        "InventoryComponent", "Inventory", "PlayerInventory",
-        "BackpackComponent", "ItemContainer", "R5InventoryComponent"
-    }
-    local INV_METHODS = {
-        "AddItem", "GiveItem", "AddItemByClass", "AddItemToInventory",
-        "SpawnItem", "CreateItem", "AddItemByPath"
-    }
+    -- Props checked post-spawn to avoid spawning N separate actors for stackables.
+    local STACK_PROPS = { "StackCount", "Count", "Amount", "Quantity", "ItemCount", "StackSize" }
+
+    -- Helper: spawn `cls` at (location, rotation) in `world`, trying the two
+    -- common UE4SS SpawnActor signatures. Returns the actor or nil.
+    local function spawnItemActor(world, cls, location, rotation)
+        local actor = nil
+        pcall(function()
+            local a = world:SpawnActor(cls, location, rotation)
+            if a and a:IsValid() then actor = a end
+        end)
+        if actor then return actor end
+        pcall(function()
+            local a = world:SpawnActor(cls, { Translation = location, Rotation = rotation, Scale3D = { X = 1, Y = 1, Z = 1 } })
+            if a and a:IsValid() then actor = a end
+        end)
+        return actor
+    end
 
     Admin._commands["wp.give"] = {
-        description = "Give a player an item (EXPERIMENTAL, see docs/items.md)",
+        description = "Spawn an item at a player's feet (see docs/items.md)",
         usage = "wp.give <player> <blueprint_path> [qty]",
         category = "admin",
         examples = {
@@ -778,8 +783,7 @@ function Admin._registerCommands()
         handler = function(args)
             if #args < 2 then return "Usage: wp.give <player> <blueprint_path> [qty]" end
             -- Blueprint paths never contain spaces, so parsing is unambiguous:
-            -- last arg = qty if numeric, penultimate-or-last arg = blueprint (starts with '/'),
-            -- everything before the blueprint = player name.
+            -- last arg = qty if numeric, otherwise last arg = blueprint.
             local n = #args
             local qty = 1
             local lastNum = tonumber(args[n])
@@ -802,58 +806,70 @@ function Admin._registerCommands()
             local char = findCharByName(targetName)
             if not char then return "Player '" .. targetName .. "' not found" end
 
-            -- Resolve the blueprint class. StaticFindObject is a UE4SS global.
             local cls = nil
             pcall(function() cls = StaticFindObject(bp) end)
             if not cls then
                 return "Blueprint class not found: " .. bp .. " (check path, must include trailing _C)"
             end
 
-            -- Find the first inventory-ish component on the character.
-            local inv, invName
-            for _, compName in ipairs(INV_COMPONENTS) do
+            -- Get world (prefer via char since we know it's valid).
+            local world = nil
+            pcall(function() world = char:GetWorld() end)
+            if not world or not world:IsValid() then
                 pcall(function()
-                    local c = char[compName]
-                    if c and c:IsValid() then inv = c; invName = compName end
+                    local worlds = FindAllOf("World")
+                    if worlds and worlds[1] and worlds[1]:IsValid() then world = worlds[1] end
                 end)
-                if inv then break end
             end
-            if not inv then
-                return "No inventory component on " .. targetName .. " (tried: " .. table.concat(INV_COMPONENTS, ", ") .. "). Run 'wp.inspect " .. targetName .. "' to discover the real name."
+            if not world or not world:IsValid() then
+                return "Could not obtain UWorld reference"
             end
 
-            -- Try each candidate method. Most UE inventory adders take either
-            -- (ItemClass, Count) or just (ItemClass). For each method we probe
-            -- the 2-arg form first (one call); if that throws, fall back to the
-            -- 1-arg form (one call), and if *that* succeeds, loop the remaining
-            -- qty-1 adds. This bounds partial writes to a single method's run.
-            local usedMethod
-            local success = false
-            local gaveOne = false  -- set once ANY successful call happens; prevents cross-method duplication
-            for _, m in ipairs(INV_METHODS) do
-                if gaveOne then break end
-                local hasMethod = false
-                pcall(function() if inv[m] then hasMethod = true end end)
-                if hasMethod then
-                    local ok2 = pcall(function() inv[m](inv, cls, qty) end)
-                    if ok2 then
-                        usedMethod = m .. "(class, qty)"; success = true; gaveOne = true
-                        break
-                    end
-                    local ok1 = pcall(function() inv[m](inv, cls) end)
-                    if ok1 then
-                        gaveOne = true
-                        for _ = 2, qty do pcall(function() inv[m](inv, cls) end) end
-                        usedMethod = m .. "(class) x" .. qty; success = true
-                        break
-                    end
+            -- Target spawn location: feet of the target player.
+            local x, y, z = getCharLocation(char)
+            if not x then return "Could not read " .. targetName .. "'s position" end
+            local rotation = { Pitch = 0, Yaw = 0, Roll = 0 }
+
+            -- First, try to spawn one and set a stack-count prop to `qty`.
+            -- If no stack prop exists, fall back to spawning qty copies with
+            -- small positional jitter so they don't clip into one point.
+            local first = spawnItemActor(world, cls, { X = x, Y = y, Z = z }, rotation)
+            if not first then
+                return "SpawnActor failed for " .. bp .. " (signature mismatch or class not spawnable)"
+            end
+
+            local stackProp = nil
+            for _, p in ipairs(STACK_PROPS) do
+                local exists = false
+                pcall(function() if first[p] ~= nil then exists = true end end)
+                if exists then stackProp = p; break end
+            end
+
+            if stackProp and qty > 1 then
+                local ok = pcall(function() first[stackProp] = qty end)
+                if ok then
+                    return string.format("Spawned %s x%d at %s's feet (stacked via %s)", bp, qty, targetName, stackProp)
                 end
+                -- fall through to loop-spawn if the write threw
             end
 
-            if not success then
-                return "Found " .. invName .. " but none of {" .. table.concat(INV_METHODS, ", ") .. "} accepted the call. Run 'wp.inspect " .. targetName .. "' to discover the right method."
+            if qty == 1 then
+                return "Spawned 1x " .. bp .. " at " .. targetName .. "'s feet"
             end
-            return "Gave " .. targetName .. " " .. qty .. "x " .. bp .. " via " .. invName .. "." .. usedMethod
+
+            -- No stack prop (or write failed): spawn the remaining qty-1 with a
+            -- tiny XY jitter so they don't all overlap at the same point.
+            local spawned = 1
+            for i = 2, qty do
+                local jx = x + ((i - 1) % 5) * 20 - 40
+                local jy = y + math.floor((i - 1) / 5) * 20 - 40
+                local a = spawnItemActor(world, cls, { X = jx, Y = jy, Z = z }, rotation)
+                if a then spawned = spawned + 1 end
+            end
+            if spawned < qty then
+                return string.format("Spawned %d/%d copies of %s (some spawns failed)", spawned, qty, bp)
+            end
+            return string.format("Spawned %d copies of %s at %s's feet", spawned, bp, targetName)
         end
     }
 
