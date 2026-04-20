@@ -567,6 +567,72 @@ function Admin._registerCommands()
         end
     }
 
+    Admin._commands["wp.probe_at"] = {
+        hidden = true, category = "debug",
+        description = "At a dotted path, list which of a fixed set of candidate property names exist. Safe: only indexes, never calls methods.",
+        usage = "wp.probe_at <player> <dotted.path>",
+        examples = {
+            "wp.probe_at CatCafe HealthComponent.CurrentHealth",
+            "wp.probe_at CatCafe HealthComponent.CurrentHealth.BaseValue",
+        },
+        playerArg = true,
+        handler = function(args)
+            if #args < 2 then return "Usage: wp.probe_at <player> <dotted.path>" end
+            local path = args[#args]
+            local targetName = table.concat(args, " ", 1, #args - 1):lower()
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+
+            -- Walk the path with pure indexing.
+            local parent = char
+            local trail = "char"
+            for segment in path:gmatch("[^%.]+") do
+                local next_v
+                pcall(function() next_v = parent[segment] end)
+                if next_v == nil then
+                    return trail .. "." .. segment .. " = nil (path incomplete)"
+                end
+                parent = next_v
+                trail = trail .. "." .. segment
+            end
+
+            -- Hardcoded candidate list — covers UE5 GAS + common R5/Windrose
+            -- attribute wrappers. No method calls on any value, just index +
+            -- type(). Safe even if some candidates exist as weird userdata.
+            local CANDIDATES = {
+                "Value", "BaseValue", "CurrentValue", "DefaultValue",
+                "Base", "Current", "Initial", "Raw",
+                "Float", "FloatValue", "NumericValue",
+                "Amount", "Stat", "StatValue", "Number",
+                "Min", "Max", "Minimum", "Maximum",
+                "Level", "Tier",
+                "bOverridden", "bClamped",
+                "Attribute", "AttributeValue", "InternalValue",
+                "Data", "AttributeData",
+            }
+            local lines = { "probing at " .. trail .. " (type=" .. type(parent) .. "):" }
+            local found = 0
+            for _, name in ipairs(CANDIDATES) do
+                local v
+                pcall(function() v = parent[name] end)
+                if v ~= nil then
+                    found = found + 1
+                    local display
+                    if type(v) == "number" or type(v) == "boolean" or type(v) == "string" then
+                        display = tostring(v)
+                    else
+                        display = type(v) .. " " .. tostring(v)
+                    end
+                    table.insert(lines, "  " .. name .. " = " .. display)
+                end
+            end
+            if found == 0 then
+                table.insert(lines, "  (none of the standard candidates matched — try wp.probe_prop with specific guesses)")
+            end
+            return table.concat(lines, "\n")
+        end
+    }
+
     -- =========================================
     -- Player state: heal / kill / freeze
     -- =========================================
