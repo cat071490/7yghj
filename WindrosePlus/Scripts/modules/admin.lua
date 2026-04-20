@@ -428,6 +428,435 @@ function Admin._registerCommands()
         end
     }
 
+    -- =========================================
+    -- Player state: heal / kill / freeze
+    -- =========================================
+
+    -- Helper: find an R5Character whose trailing FullName matches targetName (lowercased).
+    -- Returns the char object or nil.
+    local function findCharByName(targetName)
+        local chars = FindAllOf("R5Character")
+        if not chars then return nil end
+        for _, char in ipairs(chars) do
+            if char:IsValid() then
+                local charName = nil
+                pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
+                if charName and charName:lower() == targetName then
+                    return char
+                end
+            end
+        end
+        return nil
+    end
+
+    Admin._commands["wp.heal"] = {
+        description = "Restore a player's HP to full",
+        usage = "wp.heal <player>",
+        category = "admin",
+        examples = {"wp.heal HumanGenome", "wp.heal John Smith"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 1 then return "Usage: wp.heal <player>" end
+            local targetName = table.concat(args, " "):lower()
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+            local applied = false
+            pcall(function()
+                local hc = char.HealthComponent
+                if hc and hc:IsValid() then
+                    local mx = hc.MaxHealth
+                    if mx and mx > 0 then
+                        hc.CurrentHealth = mx
+                        applied = true
+                    end
+                end
+            end)
+            if not applied then return "HealthComponent not found or MaxHealth invalid for " .. targetName end
+            return "Healed " .. targetName .. " to full HP"
+        end
+    }
+
+    Admin._commands["wp.kill"] = {
+        description = "Kill a player (sets HP to 0)",
+        usage = "wp.kill <player>",
+        category = "admin",
+        examples = {"wp.kill HumanGenome"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 1 then return "Usage: wp.kill <player>" end
+            local targetName = table.concat(args, " "):lower()
+            -- Refuse to kill while god mode is active — the disable path would
+            -- restore health from the snapshot later, producing confusing state.
+            if Admin._origHealth and Admin._origHealth[targetName] then
+                return "Refusing: " .. targetName .. " has god mode active. Run 'wp.godmode " .. targetName .. " off' first."
+            end
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+            local applied = false
+            pcall(function()
+                local hc = char.HealthComponent
+                if hc and hc:IsValid() then
+                    hc.CurrentHealth = 0
+                    applied = true
+                end
+            end)
+            if not applied then return "HealthComponent not found for " .. targetName end
+            return "Killed " .. targetName
+        end
+    }
+
+    -- Freeze stashes (modifier, maxwalkspeed) snapshots so unfreeze restores to
+    -- whatever wp.speed had set prior — not to hardcoded defaults.
+    Admin._origFreeze = Admin._origFreeze or {}
+
+    Admin._commands["wp.freeze"] = {
+        description = "Freeze/unfreeze a player's movement",
+        usage = "wp.freeze <player> [on|off]",
+        category = "admin",
+        examples = {"wp.freeze HumanGenome on", "wp.freeze John Smith off"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 1 then return "Usage: wp.freeze <player> [on|off]" end
+            local n = #args
+            local last = args[n] and args[n]:lower() or ""
+            local enable, targetName
+            if last == "on" or last == "true" or last == "1" then
+                enable = true
+                targetName = n >= 2 and table.concat(args, " ", 1, n - 1):lower() or nil
+            elseif last == "off" or last == "false" or last == "0" then
+                enable = false
+                targetName = n >= 2 and table.concat(args, " ", 1, n - 1):lower() or nil
+            else
+                enable = true
+                targetName = table.concat(args, " "):lower()
+            end
+            if not targetName or targetName == "" then return "Player name required" end
+
+            local pcs = FindAllOf("PlayerController")
+            if not pcs then return "No players found" end
+            local applied = 0
+            for _, pc in ipairs(pcs) do
+                if pc:IsValid() then
+                    local pName = nil
+                    pcall(function()
+                        local ps = pc.PlayerState
+                        if ps and ps:IsValid() then
+                            local val = ps.PlayerNamePrivate
+                            if val then
+                                local ok, s = pcall(function() return val:ToString() end)
+                                if ok and s then pName = s end
+                            end
+                        end
+                    end)
+                    if pName and pName:lower() == targetName then
+                        pcall(function()
+                            local pawn = pc.Pawn
+                            if pawn and pawn:IsValid() then
+                                local mc = pawn.CharacterMovement or pawn.MovementComponent
+                                if mc and mc:IsValid() then
+                                    if enable then
+                                        if not Admin._origFreeze[targetName] then
+                                            local okMod, mod = pcall(function() return mc.CheatMovementSpeedModifer end)
+                                            local okMw, mw = pcall(function() return mc.MaxWalkSpeed end)
+                                            Admin._origFreeze[targetName] = {
+                                                modifier = okMod and mod or 1.0,
+                                                maxWalk = okMw and mw or nil
+                                            }
+                                        end
+                                        mc.CheatMovementSpeedModifer = 0
+                                        mc.MaxWalkSpeed = 0
+                                        applied = applied + 1
+                                    else
+                                        local snap = Admin._origFreeze[targetName]
+                                        if snap then
+                                            mc.CheatMovementSpeedModifer = snap.modifier or 1.0
+                                            if snap.maxWalk then mc.MaxWalkSpeed = snap.maxWalk end
+                                            Admin._origFreeze[targetName] = nil
+                                            applied = applied + 1
+                                        end
+                                    end
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+            if applied == 0 then
+                if not enable and not Admin._origFreeze[targetName] then
+                    return "Player '" .. targetName .. "' was not frozen"
+                end
+                return "Player '" .. targetName .. "' not found"
+            end
+            return (enable and "Froze " or "Unfroze ") .. targetName
+        end
+    }
+
+    -- =========================================
+    -- Teleport
+    -- =========================================
+
+    -- Helper: attempt to move a character to (x,y,z). Tries K2_SetActorLocation
+    -- first (handles replication), falls back to direct RootComponent write.
+    -- Returns true on success.
+    local function setCharLocation(char, x, y, z)
+        local vec = { X = x, Y = y, Z = z }
+        local ok = false
+        pcall(function()
+            if char.K2_SetActorLocation then
+                char:K2_SetActorLocation(vec, false, {}, false)
+                ok = true
+            end
+        end)
+        if ok then return true end
+        pcall(function()
+            if char.SetActorLocation then
+                char:SetActorLocation(vec, false, {}, false)
+                ok = true
+            end
+        end)
+        if ok then return true end
+        pcall(function()
+            local root = char.RootComponent
+            if root and root:IsValid() then
+                root.RelativeLocation = vec
+                ok = true
+            end
+        end)
+        return ok
+    end
+
+    -- Helper: read a character's current world position (mirrors _getPlayers logic).
+    local function getCharLocation(char)
+        local x, y, z
+        pcall(function()
+            local rm = char.ReplicatedMovement
+            if rm then
+                local loc = rm.Location
+                if loc then x, y, z = loc.X, loc.Y, loc.Z end
+            end
+        end)
+        if not x then
+            pcall(function()
+                local root = char.RootComponent
+                if root and root:IsValid() then
+                    local rel = root.RelativeLocation
+                    if rel then x, y, z = rel.X, rel.Y, rel.Z end
+                end
+            end)
+        end
+        return x, y, z
+    end
+
+    Admin._commands["wp.teleport"] = {
+        description = "Teleport a player to coordinates",
+        usage = "wp.teleport <player> <x> <y> <z>",
+        category = "admin",
+        examples = {"wp.teleport HumanGenome 1000 2000 150", "wp.teleport John Smith -450 1200 80"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 4 then return "Usage: wp.teleport <player> <x> <y> <z>" end
+            local n = #args
+            local x = tonumber(args[n - 2])
+            local y = tonumber(args[n - 1])
+            local z = tonumber(args[n])
+            if not (x and y and z) then return "x, y, z must be numbers" end
+            local targetName = table.concat(args, " ", 1, n - 3):lower()
+            if targetName == "" then return "Player name required" end
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+            if not setCharLocation(char, x, y, z) then
+                return "Failed to move " .. targetName .. " (no writable location method found)"
+            end
+            return string.format("Teleported %s to X=%.1f Y=%.1f Z=%.1f", targetName, x, y, z)
+        end
+    }
+
+    Admin._commands["wp.tp"] = {
+        description = "Teleport one player to another",
+        usage = "wp.tp <source> to <destination>",
+        category = "admin",
+        examples = {"wp.tp Alice to Bob", "wp.tp John Smith to Jane Doe"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 3 then return "Usage: wp.tp <source> to <destination>" end
+            -- Split args on the literal token "to" (case-insensitive). Names on
+            -- each side may contain spaces.
+            local splitIdx = nil
+            for i, a in ipairs(args) do
+                if a:lower() == "to" then splitIdx = i; break end
+            end
+            if not splitIdx or splitIdx == 1 or splitIdx == #args then
+                return "Expected: wp.tp <source> to <destination>"
+            end
+            local srcName = table.concat(args, " ", 1, splitIdx - 1):lower()
+            local dstName = table.concat(args, " ", splitIdx + 1):lower()
+            local srcChar = findCharByName(srcName)
+            if not srcChar then return "Source player '" .. srcName .. "' not found" end
+            local dstChar = findCharByName(dstName)
+            if not dstChar then return "Destination player '" .. dstName .. "' not found" end
+            local x, y, z = getCharLocation(dstChar)
+            if not x then return "Could not read destination position" end
+            if not setCharLocation(srcChar, x, y, z) then
+                return "Failed to move " .. srcName
+            end
+            return string.format("Teleported %s to %s (%.1f, %.1f, %.1f)", srcName, dstName, x, y, z)
+        end
+    }
+
+    -- =========================================
+    -- World: settime
+    -- =========================================
+
+    Admin._commands["wp.settime"] = {
+        description = "Set world time of day (hours, 0-24)",
+        usage = "wp.settime <hour>",
+        category = "world",
+        examples = {"wp.settime 12", "wp.settime 0.5", "wp.settime 23.75"},
+        handler = function(args)
+            if #args < 1 then return "Usage: wp.settime <hour>  (0-24)" end
+            local hour = tonumber(args[1])
+            if not hour then return "Hour must be a number" end
+            if hour < 0 or hour > 24 then return "Hour must be between 0 and 24" end
+
+            local types = {"R5GameMode", "R5GameState", "GameState", "WorldSettings"}
+            local props = {"TimeOfDay", "CurrentTimeOfDay"}
+            local writes = 0
+            local attempts = {}
+            for _, t in ipairs(types) do
+                local objs = FindAllOf(t)
+                if objs then
+                    for _, obj in ipairs(objs) do
+                        if obj:IsValid() then
+                            for _, p in ipairs(props) do
+                                pcall(function()
+                                    -- Only write to props that exist (reading first keeps
+                                    -- us from creating new fields on unrelated objects).
+                                    local cur = obj[p]
+                                    if cur ~= nil then
+                                        obj[p] = hour
+                                        writes = writes + 1
+                                        table.insert(attempts, t .. "." .. p)
+                                    end
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+            if writes == 0 then return "No writable time property found (tried TimeOfDay/CurrentTimeOfDay on R5GameMode/GameState/WorldSettings)" end
+            return "Set time to " .. hour .. " on: " .. table.concat(attempts, ", ")
+        end
+    }
+
+    -- =========================================
+    -- Inventory: give (experimental)
+    -- =========================================
+
+    -- EXPERIMENTAL: no confirmed inventory API on this server build. The command
+    -- probes a set of common UE inventory component + method names and calls the
+    -- first one that succeeds. If the report says "no inventory method found",
+    -- use wp.inspect on the target's R5Character to discover the real API and
+    -- extend INV_COMPONENTS / INV_METHODS below.
+    local INV_COMPONENTS = {
+        "InventoryComponent", "Inventory", "PlayerInventory",
+        "BackpackComponent", "ItemContainer", "R5InventoryComponent"
+    }
+    local INV_METHODS = {
+        "AddItem", "GiveItem", "AddItemByClass", "AddItemToInventory",
+        "SpawnItem", "CreateItem", "AddItemByPath"
+    }
+
+    Admin._commands["wp.give"] = {
+        description = "Give a player an item (EXPERIMENTAL, see docs/items.md)",
+        usage = "wp.give <player> <blueprint_path> [qty]",
+        category = "admin",
+        examples = {
+            "wp.give HumanGenome /Game/Core/Items/Currency/BP_GoldCoin.BP_GoldCoin_C 100",
+            "wp.give Alice /Game/Core/Items/Weapons/Ranged/BP_Flintlock.BP_Flintlock_C",
+        },
+        playerArg = true,
+        handler = function(args)
+            if #args < 2 then return "Usage: wp.give <player> <blueprint_path> [qty]" end
+            -- Blueprint paths never contain spaces, so parsing is unambiguous:
+            -- last arg = qty if numeric, penultimate-or-last arg = blueprint (starts with '/'),
+            -- everything before the blueprint = player name.
+            local n = #args
+            local qty = 1
+            local lastNum = tonumber(args[n])
+            local bpIdx
+            if lastNum and lastNum > 0 then
+                qty = math.floor(lastNum)
+                bpIdx = n - 1
+            else
+                bpIdx = n
+            end
+            if bpIdx < 2 then return "Missing player or blueprint path" end
+            local bp = args[bpIdx]
+            if not bp:find("^/") then
+                return "Blueprint path must start with '/' (e.g., /Game/Core/Items/.../BP_X.BP_X_C). See docs/items.md"
+            end
+            local targetName = table.concat(args, " ", 1, bpIdx - 1):lower()
+            if targetName == "" then return "Player name required" end
+            if qty < 1 or qty > 1000 then return "qty must be between 1 and 1000" end
+
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+
+            -- Resolve the blueprint class. StaticFindObject is a UE4SS global.
+            local cls = nil
+            pcall(function() cls = StaticFindObject(bp) end)
+            if not cls then
+                return "Blueprint class not found: " .. bp .. " (check path, must include trailing _C)"
+            end
+
+            -- Find the first inventory-ish component on the character.
+            local inv, invName
+            for _, compName in ipairs(INV_COMPONENTS) do
+                pcall(function()
+                    local c = char[compName]
+                    if c and c:IsValid() then inv = c; invName = compName end
+                end)
+                if inv then break end
+            end
+            if not inv then
+                return "No inventory component on " .. targetName .. " (tried: " .. table.concat(INV_COMPONENTS, ", ") .. "). Run 'wp.inspect " .. targetName .. "' to discover the real name."
+            end
+
+            -- Try each candidate method. Most UE inventory adders take either
+            -- (ItemClass, Count) or just (ItemClass). For each method we probe
+            -- the 2-arg form first (one call); if that throws, fall back to the
+            -- 1-arg form (one call), and if *that* succeeds, loop the remaining
+            -- qty-1 adds. This bounds partial writes to a single method's run.
+            local usedMethod
+            local success = false
+            local gaveOne = false  -- set once ANY successful call happens; prevents cross-method duplication
+            for _, m in ipairs(INV_METHODS) do
+                if gaveOne then break end
+                local hasMethod = false
+                pcall(function() if inv[m] then hasMethod = true end end)
+                if hasMethod then
+                    local ok2 = pcall(function() inv[m](inv, cls, qty) end)
+                    if ok2 then
+                        usedMethod = m .. "(class, qty)"; success = true; gaveOne = true
+                        break
+                    end
+                    local ok1 = pcall(function() inv[m](inv, cls) end)
+                    if ok1 then
+                        gaveOne = true
+                        for _ = 2, qty do pcall(function() inv[m](inv, cls) end) end
+                        usedMethod = m .. "(class) x" .. qty; success = true
+                        break
+                    end
+                end
+            end
+
+            if not success then
+                return "Found " .. invName .. " but none of {" .. table.concat(INV_METHODS, ", ") .. "} accepted the call. Run 'wp.inspect " .. targetName .. "' to discover the right method."
+            end
+            return "Gave " .. targetName .. " " .. qty .. "x " .. bp .. " via " .. invName .. "." .. usedMethod
+        end
+    }
+
     Admin._commands["wp.health"] = {
         description = "Read player health",
         usage = "wp.health [player]",
