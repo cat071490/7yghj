@@ -308,6 +308,63 @@ function Admin._registerCommands()
         end
     }
 
+    Admin._commands["wp.godmode"] = {
+        description = "Enable/disable invulnerability for a target player",
+        usage = "wp.godmode <player> [on|off]",
+        category = "admin",
+        examples = {"wp.godmode HumanGenome on", "wp.godmode John Smith off", "wp.godmode HumanGenome"},
+        playerArg = true,
+        handler = function(args)
+            if #args < 1 then
+                return "Usage: wp.godmode <player> [on|off]\n  Targets a single player. Defaults to 'on' if toggle omitted."
+            end
+
+            -- Arg parsing mirrors wp.speed: RCON splits on whitespace and player names
+            -- can contain spaces, so treat the last arg as the toggle only if it looks
+            -- like one; otherwise the whole arg list is the player name and we default on.
+            local n = #args
+            local last = args[n] and args[n]:lower() or ""
+            local enable
+            local targetName
+            if last == "on" or last == "true" or last == "1" or last == "enable" then
+                enable = true
+                targetName = n >= 2 and table.concat(args, " ", 1, n - 1):lower() or nil
+            elseif last == "off" or last == "false" or last == "0" or last == "disable" then
+                enable = false
+                targetName = n >= 2 and table.concat(args, " ", 1, n - 1):lower() or nil
+            else
+                enable = true
+                targetName = table.concat(args, " "):lower()
+            end
+
+            if not targetName or targetName == "" then
+                return "Player name required (god mode must target a specific player)"
+            end
+
+            local chars = FindAllOf("R5Character")
+            if not chars then return "No character data" end
+
+            local count = 0
+            for _, char in ipairs(chars) do
+                if char:IsValid() then
+                    local charName = nil
+                    pcall(function() charName = char:GetFullName():match("([^%.]+)$") end)
+                    if charName and charName:lower() == targetName then
+                        pcall(function() char.bCanBeDamaged = not enable end)
+                        pcall(function() char.bIsInvulnerable = enable end)
+                        pcall(function() char.bInvincible = enable end)
+                        count = count + 1
+                    end
+                end
+            end
+
+            if count == 0 then
+                return "Player '" .. targetName .. "' not found"
+            end
+            return "God mode " .. (enable and "enabled" or "disabled") .. " for " .. targetName
+        end
+    }
+
     Admin._commands["wp.health"] = {
         description = "Read player health",
         usage = "wp.health [player]",
