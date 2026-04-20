@@ -498,7 +498,7 @@ function Admin._registerCommands()
 
     Admin._commands["wp.probe_char"] = {
         hidden = true, category = "debug",
-        description = "Dump components and health-ish properties on a player's character",
+        description = "List which candidate component names exist on a player's character (read-only, no traversal)",
         usage = "wp.probe_char <player>",
         playerArg = true,
         handler = function(args)
@@ -507,95 +507,63 @@ function Admin._registerCommands()
             local char = findCharByName(targetName)
             if not char then return "Player '" .. targetName .. "' not found" end
 
-            local lines = {}
-            pcall(function() table.insert(lines, "FullName: " .. char:GetFullName()) end)
-
-            -- Probe likely component names.
-            local compCandidates = {
+            -- Minimal probe. Only reads char[name] and reports whether it's
+            -- non-nil and the Lua type. No :IsValid(), no :GetClass(), no
+            -- recursion into UObject props — those can trigger C++ exceptions
+            -- that bypass pcall and crash UE4SS. Use wp.probe_prop once you
+            -- know which component to drill into.
+            local names = {
                 "HealthComponent", "Health", "HealthSystem", "R5HealthComponent",
                 "BLHealthComponent", "VitalsComponent", "DamageComponent",
                 "StatsComponent", "AttributeComponent", "AttributeSet",
-                "AbilitySystemComponent", "ASC", "StaminaComponent", "HungerComponent",
-                "ThirstComponent", "DamageSystem", "CombatComponent",
+                "AbilitySystemComponent", "StaminaComponent", "HungerComponent",
+                "ThirstComponent",
+                -- direct-scalar candidates (bools/numbers)
+                "bCanBeDamaged", "bIsInvulnerable", "bInvincible", "bGodMode",
             }
-            table.insert(lines, "--- Components on character ---")
-            for _, name in ipairs(compCandidates) do
-                pcall(function()
-                    local c = char[name]
-                    if c and c:IsValid() then
-                        local fn = "?"
-                        pcall(function() fn = c:GetFullName() end)
-                        table.insert(lines, "  " .. name .. " = " .. fn)
-                    end
-                end)
+            local lines = { "char property presence (non-nil only):" }
+            for _, name in ipairs(names) do
+                local v
+                pcall(function() v = char[name] end)
+                if v ~= nil then
+                    table.insert(lines, "  " .. name .. " :: " .. type(v))
+                end
             end
-
-            -- Probe scalar health-ish properties directly on the character.
-            local propCandidates = {
-                "Health", "CurrentHealth", "MaxHealth", "BaseHealth",
-                "HP", "CurrentHP", "MaxHP",
-                "Stamina", "CurrentStamina", "MaxStamina",
-                "Armor", "CurrentArmor", "MaxArmor",
-                "bCanBeDamaged", "bIsInvulnerable", "bInvincible",
-                "bGodMode", "bImmortal",
-            }
-            table.insert(lines, "--- Scalar properties on character ---")
-            for _, name in ipairs(propCandidates) do
-                pcall(function()
-                    local v = char[name]
-                    if v ~= nil then
-                        table.insert(lines, "  " .. name .. " = " .. tostring(v))
-                    end
-                end)
-            end
-
-            -- Dig into each component for its scalar props AND any UObject
-            -- props (UE5 gameplay attributes often wrap the float in a sub-obj,
-            -- so we need to peek one level deeper).
-            table.insert(lines, "--- Properties on found components ---")
-            local compPropCandidates = {
-                "CurrentHealth", "MaxHealth", "Health", "BaseHealth",
-                "CurrentHP", "MaxHP", "HP",
-                "bInvulnerable", "bIsInvulnerable", "bInvincible", "bGodMode",
-                "HealthAttributeSet", "AttributeSet", "Attributes",
-            }
-            local innerPropCandidates = {
-                "BaseValue", "CurrentValue", "Value", "DefaultValue",
-                "Minimum", "Maximum", "BaseHealth", "HealthRegenRate",
-            }
-            for _, cname in ipairs(compCandidates) do
-                pcall(function()
-                    local c = char[cname]
-                    if c and c:IsValid() then
-                        for _, pname in ipairs(compPropCandidates) do
-                            pcall(function()
-                                local v = c[pname]
-                                if v ~= nil then
-                                    local disp = tostring(v)
-                                    -- If it's a UObject, dump its class + inner props.
-                                    local cls = nil
-                                    pcall(function() cls = v:GetClass():GetFullName() end)
-                                    if cls then
-                                        table.insert(lines, "  " .. cname .. "." .. pname .. " = <" .. cls .. ">")
-                                        for _, ip in ipairs(innerPropCandidates) do
-                                            pcall(function()
-                                                local iv = v[ip]
-                                                if iv ~= nil then
-                                                    table.insert(lines, "    ." .. ip .. " = " .. tostring(iv))
-                                                end
-                                            end)
-                                        end
-                                    else
-                                        table.insert(lines, "  " .. cname .. "." .. pname .. " = " .. disp)
-                                    end
-                                end
-                            end)
-                        end
-                    end
-                end)
-            end
-
             return table.concat(lines, "\n")
+        end
+    }
+
+    Admin._commands["wp.probe_prop"] = {
+        hidden = true, category = "debug",
+        description = "Read a dotted property path on a player's character. Read-only, one level at a time.",
+        usage = "wp.probe_prop <player> <dotted.path>",
+        examples = {
+            "wp.probe_prop CatCafe HealthComponent",
+            "wp.probe_prop CatCafe HealthComponent.CurrentHealth",
+            "wp.probe_prop CatCafe HealthComponent.CurrentHealth.BaseValue",
+        },
+        playerArg = true,
+        handler = function(args)
+            if #args < 2 then return "Usage: wp.probe_prop <player> <dotted.path>" end
+            -- Last arg is the path; everything before is the player name.
+            local path = args[#args]
+            local targetName = table.concat(args, " ", 1, #args - 1):lower()
+            local char = findCharByName(targetName)
+            if not char then return "Player '" .. targetName .. "' not found" end
+
+            local cur = char
+            local trail = "char"
+            for segment in path:gmatch("[^%.]+") do
+                local next_v
+                pcall(function() next_v = cur[segment] end)
+                if next_v == nil then
+                    return trail .. "." .. segment .. " = nil"
+                end
+                cur = next_v
+                trail = trail .. "." .. segment
+            end
+            -- Report type + tostring. Do NOT call any methods on the value.
+            return trail .. " :: " .. type(cur) .. " = " .. tostring(cur)
         end
     }
 
